@@ -11,6 +11,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
+#include "esp_random.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "nvs_flash.h"
@@ -18,27 +19,90 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "driver/i2s_std.h"
+
+#if __has_include("bsp_pins.h")
 #include "bsp_pins.h"
+#endif
+
+// 自包含硬件管脚定义（针对 FoloToy AI-Passport ESP32-C3）
+#ifndef BSP_LCD_WIDTH
+#define BSP_LCD_WIDTH           240
+#endif
+#ifndef BSP_LCD_HEIGHT
+#define BSP_LCD_HEIGHT          320
+#endif
+#ifndef BSP_LCD_SPI_HOST
+#define BSP_LCD_SPI_HOST        SPI2_HOST
+#endif
+#ifndef BSP_LCD_CS
+#define BSP_LCD_CS              GPIO_NUM_1
+#endif
+#ifndef BSP_LCD_SCLK
+#define BSP_LCD_SCLK            GPIO_NUM_4
+#endif
+#ifndef BSP_LCD_MOSI
+#define BSP_LCD_MOSI            GPIO_NUM_6
+#endif
+#ifndef BSP_LCD_DC
+#define BSP_LCD_DC              GPIO_NUM_5
+#endif
+#ifndef BSP_LCD_BACKLIGHT
+#define BSP_LCD_BACKLIGHT       GPIO_NUM_21
+#endif
+#ifndef BSP_LCD_FREQ_HZ
+#define BSP_LCD_FREQ_HZ         (40 * 1000 * 1000)
+#endif
+
+// 物理按键定义
+#ifndef BSP_BTN_UP_GPIO
+#define BSP_BTN_UP_GPIO         GPIO_NUM_2   // Arrow UP (上键: 抖烟灰)
+#endif
+#ifndef BSP_BTN_DOWN_GPIO
+#define BSP_BTN_DOWN_GPIO       GPIO_NUM_3   // Arrow DOWN (下键: 抖烟灰)
+#endif
+#ifndef BSP_BTN_OK_GPIO
+#define BSP_BTN_OK_GPIO         GPIO_NUM_9   // OK 按键 (点火/新烟)
+#endif
+#ifndef BSP_BTN_POWER_GPIO
+#define BSP_BTN_POWER_GPIO      GPIO_NUM_8   // 电源键 (息屏/唤醒)
+#endif
+
+// 麦克风音频采集
+#ifndef BSP_I2S_NUM
+#define BSP_I2S_NUM             I2S_NUM_0
+#endif
+#ifndef BSP_I2S_BCLK
+#define BSP_I2S_BCLK            GPIO_NUM_10
+#endif
+#ifndef BSP_I2S_WS
+#define BSP_I2S_WS              GPIO_NUM_11
+#endif
+#ifndef BSP_I2S_DIN
+#define BSP_I2S_DIN             GPIO_NUM_18
+#endif
+#ifndef BSP_I2S_SAMPLE_RATE
+#define BSP_I2S_SAMPLE_RATE     16000
+#endif
 
 static const char *TAG = "AI_PASSPORT_VAPE";
 
-// RGB565 Colors
+// RGB565 颜色定义
 #define COLOR_BLACK         0x0000
 #define COLOR_WHITE         0xFFFF
-#define COLOR_DARK_BG       0x0841  // #09090b
-#define COLOR_AMBER         0xD380  // Cork Filter #b45309
-#define COLOR_GOLD          0xFD20  // #facc15
-#define COLOR_PAPER         0xE71C  // #e4e4e7
-#define COLOR_PAPER_SHADOW  0xA514  // #a1a1aa
-#define COLOR_CHAR_BROWN    0x79A0  // #78350f
-#define COLOR_CHAR_BLACK    0x18C3  // #1c1917
-#define COLOR_EMBER_RED     0xD8A0  // #dc2626
-#define COLOR_EMBER_ORANGE  0xFA60  // #f97316
-#define COLOR_EMBER_YELLOW  0xFFE0  // #fef08a
-#define COLOR_ASH_GREY      0x738E  // #71717a
-#define COLOR_ASH_DARK      0x39E7  // #3f3f46
-#define COLOR_FLAME_BLUE    0x3DEF  // #38bdf8
-#define COLOR_SMOKE         0xDEFB  // #d4d4d8
+#define COLOR_DARK_BG       0x0841
+#define COLOR_AMBER         0xD380
+#define COLOR_GOLD          0xFD20
+#define COLOR_PAPER         0xE71C
+#define COLOR_PAPER_SHADOW  0xA514
+#define COLOR_CHAR_BROWN    0x79A0
+#define COLOR_CHAR_BLACK    0x18C3
+#define COLOR_EMBER_RED     0xD8A0
+#define COLOR_EMBER_ORANGE  0xFA60
+#define COLOR_EMBER_YELLOW  0xFFE0
+#define COLOR_ASH_GREY      0x738E
+#define COLOR_ASH_DARK      0x39E7
+#define COLOR_FLAME_BLUE    0x3DEF
+#define COLOR_SMOKE         0xDEFB
 #define COLOR_CYAN          0x067F
 #define COLOR_GREEN         0x3706
 
@@ -82,7 +146,7 @@ static i2s_chan_handle_t s_rx_chan = NULL;
 
 typedef struct {
     const char *title;
-    uint32_t target_count; // 晋升下一境界所需吸烟根数 (进入本境界后从0计数)
+    uint32_t target_count;
     bool is_yandi;
     const char *badge;
 } rank_info_t;
@@ -107,7 +171,7 @@ static const rank_info_t* get_current_realm(uint8_t realm_id) {
     return &REALM_TIERS[realm_id];
 }
 
-// NVS Persistence
+// NVS 持久化
 static void nvs_load_smoked_count(void) {
     nvs_handle_t h;
     if (nvs_open("vape_data", NVS_READWRITE, &h) == ESP_OK) {
@@ -132,7 +196,14 @@ static void nvs_save_smoked_count(uint8_t realm_id, uint32_t cur_cnt, uint32_t t
     }
 }
 
-// ST7789 Low-Level Driver
+static void flick_ash(void) {
+    if (g_vape.ash_length > 0.0f) {
+        ESP_LOGI(TAG, "Ash flicked! Dropped: %.1f%%", g_vape.ash_length);
+        g_vape.ash_length = 0.0f;
+    }
+}
+
+// ST7789 驱动
 static void lcd_cmd(spi_device_handle_t spi, const uint8_t cmd) {
     gpio_set_level(BSP_LCD_DC, 0);
     spi_transaction_t t = { .length = 8, .tx_buffer = &cmd };
@@ -180,10 +251,14 @@ static void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16
 }
 
 static void lcd_init_st7789(void) {
+#if defined(BSP_LCD_RST) && (BSP_LCD_RST >= 0)
     gpio_set_level(BSP_LCD_RST, 0);
     vTaskDelay(pdMS_TO_TICKS(50));
     gpio_set_level(BSP_LCD_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(120));
+#else
+    vTaskDelay(pdMS_TO_TICKS(120));
+#endif
 
     lcd_cmd(s_spi_lcd, 0x11);
     vTaskDelay(pdMS_TO_TICKS(120));
@@ -203,7 +278,7 @@ static void lcd_init_st7789(void) {
     lcd_fill_rect(0, 0, BSP_LCD_WIDTH, BSP_LCD_HEIGHT, COLOR_DARK_BG);
 }
 
-// I2S Microphone
+// I2S 麦克风
 static void i2s_mic_init(void) {
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(BSP_I2S_NUM, I2S_ROLE_MASTER);
     i2s_new_channel(&chan_cfg, NULL, &s_rx_chan);
@@ -232,108 +307,100 @@ static uint8_t sample_mic_suction_strength(void) {
         int count = bytes_read / sizeof(int16_t);
         int64_t sum_sq = 0;
         for (int i = 0; i < count; i++) sum_sq += (int64_t)r_buf[i] * r_buf[i];
-        int rms = (int)sqrt((double)sum_sq / count);
-        int suction = (rms - 300) * 100 / 2500;
-        if (suction < 0) suction = 0;
-        if (suction > 100) suction = 100;
-        return (uint8_t)suction;
+        int rms = (int)sqrtf((float)(sum_sq / count));
+        int strength = (rms - 200) / 25;
+        if (strength < 0) strength = 0;
+        if (strength > 100) strength = 100;
+        return (uint8_t)strength;
     }
     return 0;
 }
 
-// Ash Flicking on UP / DOWN buttons
-static void flick_ash(void) {
-    if (g_vape.ash_length < 3.0f) return;
-    ESP_LOGI(TAG, "Ash flicked! Reset ash to 0%%");
-    g_vape.ash_length = 0.0f;
-    lcd_fill_rect(95, 26, 50, 70, COLOR_DARK_BG);
-}
-
-// Vertical Cigarette & OLED UI Renderer
 static void render_vape_ui(void) {
-    if (!g_vape.screen_awake) {
-        lcd_fill_rect(0, 0, BSP_LCD_WIDTH, BSP_LCD_HEIGHT, COLOR_BLACK);
-        return;
-    }
+    if (!g_vape.screen_awake) return;
 
-    // 1. Top status bar
-    lcd_fill_rect(0, 0, BSP_LCD_WIDTH, 24, 0x18C3);
-    uint16_t batt_color = g_vape.battery_percent < 20 ? COLOR_EMBER_RED : COLOR_GREEN;
-    lcd_fill_rect(10, 6, 24, 12, batt_color);
-    lcd_fill_rect(34, 9, 3, 6, batt_color);
+    // 1. 顶部状态栏 (y: 0 ~ 24)
+    lcd_fill_rect(0, 0, BSP_LCD_WIDTH, 24, 0x1082);
+    int bat_w = (int)((g_vape.battery_percent / 100.0f) * 22);
+    lcd_fill_rect(BSP_LCD_WIDTH - 30, 6, 24, 12, COLOR_ASH_GREY);
+    lcd_fill_rect(BSP_LCD_WIDTH - 29, 7, bat_w, 10, COLOR_GREEN);
+    lcd_fill_rect(BSP_LCD_WIDTH - 6, 9, 2, 6, COLOR_ASH_GREY);
 
-    uint16_t juice_color = g_vape.juice_percent < 15 ? COLOR_EMBER_RED : COLOR_FLAME_BLUE;
-    lcd_fill_rect(BSP_LCD_WIDTH - 36, 6, 26, 12, juice_color);
+    int juice_w = (int)((g_vape.juice_percent / 100.0f) * 22);
+    lcd_fill_rect(BSP_LCD_WIDTH - 60, 6, 24, 12, COLOR_ASH_GREY);
+    lcd_fill_rect(BSP_LCD_WIDTH - 59, 7, juice_w, 10, COLOR_CYAN);
 
-    // 2. Vertical Cigarette
-    const int center_x = 120;
-    const int cig_width = 24;
-    const int cig_left = center_x - (cig_width / 2);
-    const int filter_bottom = 240;
-    const int filter_height = 45;
-    const int filter_top = filter_bottom - filter_height;
-    const int max_shaft_len = 125;
+    // 2. 电子烟拟真本体 (y: 35 ~ 255)
+    uint16_t cig_width = 38;
+    uint16_t cig_left = (BSP_LCD_WIDTH - cig_width) / 2;
+    uint16_t total_cig_h = 210;
+    uint16_t filter_h = 45;
+    uint16_t filter_top = 35 + total_cig_h - filter_h;
 
-    int current_shaft = (int)((max_shaft_len * g_vape.tobacco_remaining) / 100.0f);
-    int tip_y = filter_top - current_shaft;
+    // 滤嘴
+    lcd_fill_rect(cig_left, filter_top, cig_width, filter_h, COLOR_AMBER);
+    lcd_fill_rect(cig_left, filter_top, 4, filter_h, 0x8A40);
+    lcd_fill_rect(cig_left + cig_width - 5, filter_top, 5, filter_h, 0x8A40);
 
-    lcd_fill_rect(cig_left - 30, 26, cig_width + 60, 220, COLOR_DARK_BG);
-
-    // Filter
-    lcd_fill_rect(cig_left, filter_top, cig_width, filter_height, COLOR_AMBER);
-    lcd_fill_rect(cig_left - 1, filter_top - 2, cig_width + 2, 3, COLOR_GOLD);
-
-    // Paper shaft
-    if (current_shaft > 0) {
-        lcd_fill_rect(cig_left, tip_y, cig_width, current_shaft, COLOR_PAPER);
-        lcd_fill_rect(cig_left, tip_y, 3, current_shaft, COLOR_WHITE);
-        lcd_fill_rect(cig_left + cig_width - 3, tip_y, 3, current_shaft, COLOR_PAPER_SHADOW);
-
-        if (g_vape.state == STATE_BURNING || g_vape.state == STATE_LIGHTING) {
-            lcd_fill_rect(cig_left, tip_y, cig_width, 6, COLOR_CHAR_BROWN);
-            lcd_fill_rect(cig_left, tip_y, cig_width, 2, COLOR_CHAR_BLACK);
-        }
-    }
+    // 烟杆主体背景
+    lcd_fill_rect(cig_left, 35, cig_width, total_cig_h - filter_h, COLOR_DARK_BG);
 
     if (g_vape.state == STATE_UNLIT) {
-        lcd_fill_rect(cig_left, tip_y - 3, cig_width, 3, COLOR_CHAR_BROWN);
-        lcd_fill_rect(center_x - 1, tip_y - 12, 2, 6, COLOR_FLAME_BLUE);
-        lcd_fill_rect(center_x - 4, tip_y - 9, 8, 2, COLOR_FLAME_BLUE);
+        lcd_fill_rect(cig_left, 35, cig_width, total_cig_h - filter_h, COLOR_PAPER);
+        lcd_fill_rect(cig_left, 35, 4, total_cig_h - filter_h, COLOR_PAPER_SHADOW);
+        lcd_fill_rect(cig_left + cig_width - 4, 35, 4, total_cig_h - filter_h, COLOR_PAPER_SHADOW);
     } else if (g_vape.state == STATE_LIGHTING) {
+        lcd_fill_rect(cig_left, 35, cig_width, total_cig_h - filter_h, COLOR_PAPER);
+        // 点火火焰
         int flame_h = 24 + (esp_random() % 6);
-        lcd_fill_rect(center_x - 6, tip_y - flame_h, 12, flame_h, COLOR_EMBER_ORANGE);
-        lcd_fill_rect(center_x - 3, tip_y - flame_h + 4, 6, flame_h - 8, COLOR_EMBER_YELLOW);
-        lcd_fill_rect(center_x - 2, tip_y - 4, 4, 4, COLOR_FLAME_BLUE);
+        lcd_fill_rect(cig_left - 4, 35 - flame_h, cig_width + 8, flame_h, COLOR_FLAME_BLUE);
+        lcd_fill_rect(cig_left + 4, 35 - flame_h + 4, cig_width - 8, flame_h - 6, COLOR_GOLD);
+        lcd_fill_rect(cig_left + 10, 35 - flame_h + 8, cig_width - 20, flame_h - 10, COLOR_WHITE);
     } else if (g_vape.state == STATE_BURNING) {
-        // Ash column length proportional to 125px cigarette shaft
-        int ash_h = (int)((g_vape.ash_length / 100.0f) * 125.0f);
-        if (ash_h > 0) {
-            lcd_fill_rect(cig_left + 1, tip_y - ash_h, cig_width - 2, ash_h, COLOR_ASH_GREY);
+        float unburned_ratio = g_vape.tobacco_remaining / 100.0f;
+        float ash_ratio = g_vape.ash_length / 100.0f;
+        int max_tobacco_h = total_cig_h - filter_h;
+
+        int unburned_h = (int)(unburned_ratio * max_tobacco_h);
+        int ash_h = (int)(ash_ratio * max_tobacco_h);
+        if (ash_h > 45) ash_h = 45;
+
+        int unburned_top = filter_top - unburned_h;
+        if (unburned_h > 0) {
+            lcd_fill_rect(cig_left, unburned_top, cig_width, unburned_h, COLOR_PAPER);
+            lcd_fill_rect(cig_left, unburned_top, 4, unburned_h, COLOR_PAPER_SHADOW);
+            lcd_fill_rect(cig_left + cig_width - 4, unburned_top, 4, unburned_h, COLOR_PAPER_SHADOW);
         }
 
-        bool is_puffing = g_vape.suction_strength > 10;
-        uint16_t ember_core = is_puffing ? COLOR_WHITE : COLOR_EMBER_ORANGE;
-        lcd_fill_rect(cig_left - 1, tip_y - 1, cig_width + 2, 4, COLOR_EMBER_RED);
-        lcd_fill_rect(cig_left + 2, tip_y - 1, cig_width - 4, 3, ember_core);
+        // 燃烧火圈
+        int ember_top = unburned_top - 6;
+        if (ember_top >= 35) {
+            uint16_t ember_col = (g_vape.suction_strength > 10) ? COLOR_EMBER_YELLOW : COLOR_EMBER_ORANGE;
+            lcd_fill_rect(cig_left - 2, ember_top, cig_width + 4, 6, ember_col);
+            lcd_fill_rect(cig_left + 4, ember_top + 1, cig_width - 8, 4, COLOR_EMBER_RED);
+        }
 
-        int smoke_y = tip_y - ash_h - (esp_random() % 25);
-        int smoke_x = center_x + ((int)(esp_random() % 16) - 8);
-        lcd_fill_rect(smoke_x, smoke_y, 4, 4, COLOR_SMOKE);
+        // 烟灰
+        int ash_top = ember_top - ash_h;
+        if (ash_h > 0 && ash_top >= 35) {
+            lcd_fill_rect(cig_left, ash_top, cig_width, ash_h, COLOR_ASH_GREY);
+            for (int i = 0; i < ash_h; i += 4) {
+                lcd_fill_rect(cig_left + 2, ash_top + i, cig_width - 4, 2, COLOR_ASH_DARK);
+            }
+        }
     } else if (g_vape.state == STATE_BURNED_OUT) {
         lcd_fill_rect(cig_left, filter_top - 4, cig_width, 4, COLOR_CHAR_BLACK);
     }
 
-    // 3. Cultivation Rank Display (y: 265 ~ 318)
+    // 3. 境界进度展示 (y: 265 ~ 318)
     const rank_info_t *cur_realm = get_current_realm(g_vape.realm_id);
     lcd_fill_rect(6, 265, BSP_LCD_WIDTH - 12, 50, cur_realm->is_yandi ? 0x3180 : 0x1082);
     lcd_fill_rect(8, 267, BSP_LCD_WIDTH - 16, 46, cur_realm->is_yandi ? 0x41C0 : COLOR_DARK_BG);
 
     if (cur_realm->is_yandi) {
-        // Imperial 👑【烟帝】Banner + 吸烟根数
         lcd_fill_rect(16, 272, BSP_LCD_WIDTH - 32, 16, COLOR_GOLD);
         lcd_fill_rect(24, 294, BSP_LCD_WIDTH - 48, 12, COLOR_EMBER_YELLOW);
     } else {
-        // Per-realm progress bar: resets to 0 upon entering each new realm!
         float prog = cur_realm->target_count > 0 ? ((float)g_vape.current_realm_smoked / cur_realm->target_count) : 1.0f;
         if (prog > 1.0f) prog = 1.0f;
         int progress_w = (int)(prog * (BSP_LCD_WIDTH - 40));
@@ -346,7 +413,7 @@ void app_main(void) {
     nvs_flash_init();
     nvs_load_smoked_count();
 
-    // Buttons
+    // 按键 GPIO 初始化
     gpio_config_t btn_cfg = {
         .pin_bit_mask = (1ULL << BSP_BTN_UP_GPIO) | (1ULL << BSP_BTN_DOWN_GPIO) |
                         (1ULL << BSP_BTN_OK_GPIO) | (1ULL << BSP_BTN_POWER_GPIO),
@@ -355,14 +422,18 @@ void app_main(void) {
     };
     gpio_config(&btn_cfg);
 
-    // LCD Pins
+    // LCD 引脚配置（安全过滤负数引脚，避免位移报错）
+    uint64_t lcd_mask = (1ULL << BSP_LCD_DC) | (1ULL << BSP_LCD_BACKLIGHT);
+#if defined(BSP_LCD_RST) && (BSP_LCD_RST >= 0)
+    lcd_mask |= (1ULL << BSP_LCD_RST);
+#endif
     gpio_config_t lcd_pins = {
-        .pin_bit_mask = (1ULL << BSP_LCD_DC) | (1ULL << BSP_LCD_RST) | (1ULL << BSP_LCD_BACKLIGHT),
+        .pin_bit_mask = lcd_mask,
         .mode = GPIO_MODE_OUTPUT,
     };
     gpio_config(&lcd_pins);
 
-    // SPI2
+    // SPI2 初始化
     spi_bus_config_t buscfg = {
         .mosi_io_num = BSP_LCD_MOSI, .miso_io_num = -1, .sclk_io_num = BSP_LCD_SCLK,
         .quadwp_io_num = -1, .quadhd_io_num = -1,
@@ -416,7 +487,6 @@ void app_main(void) {
 
         g_vape.suction_strength = sample_mic_suction_strength();
 
-        // 麦克风吸气声控引燃：未点燃时吸气，声控气流自动点火
         if (g_vape.state == STATE_UNLIT && g_vape.screen_awake && g_vape.suction_strength > 15) {
             g_vape.state = STATE_LIGHTING;
             g_vape.state_timer_ms = esp_timer_get_time() / 1000;
@@ -426,44 +496,38 @@ void app_main(void) {
         if (g_vape.state == STATE_BURNING && g_vape.screen_awake) {
             float burn_rate = 0.0f;
             if (g_vape.suction_strength > 10) {
-                // 每次吸烟非匀速燃烧：随机根据吸入声音强弱与气流湍流判定燃烧长度 (通常 9-15 口吸完)
                 float sound_ratio = (g_vape.suction_strength - 10.0f) / 90.0f;
                 if (sound_ratio < 0.0f) sound_ratio = 0.0f;
                 if (sound_ratio > 1.0f) sound_ratio = 1.0f;
-                float turbulence = 0.82f + ((float)(esp_random() % 360) / 1000.0f); // ±18%
+                float turbulence = 0.82f + ((float)(esp_random() % 360) / 1000.0f);
                 burn_rate = (0.26f + powf(sound_ratio, 0.75f) * 0.26f) * turbulence;
                 g_vape.juice_percent -= 0.08f;
             } else {
-                // 没有吸入操作时速度明显极慢减缓 (自然阴燃微耗 ~0.0005f / tick，比抽吸慢 300+ 倍)
                 burn_rate = 0.0005f;
             }
 
             g_vape.tobacco_remaining -= burn_rate;
             g_vape.ash_length += burn_rate;
 
-            // 烟灰物理规则：平时不抖烟灰不掉；超过 45% 临界长度时重力超限自动掉落，掉落后重新从 0 开始计算累积
             if (g_vape.ash_length >= 45.0f) {
-                ESP_LOGW(TAG, "Ash reached 45%% limit! Gravity snap, ash auto-dropped, recalculating from 0%%.");
-                g_vape.ash_length = 0.0f; // 自然脱落，重置为 0，后续燃烧重新计算
+                ESP_LOGW(TAG, "Ash reached 45%% limit! Gravity snap, ash auto-dropped.");
+                g_vape.ash_length = 0.0f;
             }
 
-                if (g_vape.tobacco_remaining <= 0.0f) {
-                    g_vape.tobacco_remaining = 0.0f;
-                    g_vape.state = STATE_BURNED_OUT;
-                    g_vape.total_smoked++;
-                    g_vape.current_realm_smoked++;
+            if (g_vape.tobacco_remaining <= 0.0f) {
+                g_vape.tobacco_remaining = 0.0f;
+                g_vape.state = STATE_BURNED_OUT;
+                g_vape.total_smoked++;
+                g_vape.current_realm_smoked++;
 
-                    const rank_info_t *cur_tier = get_current_realm(g_vape.realm_id);
-                    if (g_vape.realm_id < 11 && cur_tier->target_count > 0 && g_vape.current_realm_smoked >= cur_tier->target_count) {
-                        // 进入一个新境界，吸烟数量从0开始计数！
-                        g_vape.realm_id++;
-                        g_vape.current_realm_smoked = 0;
-                        ESP_LOGI(TAG, "Breakthrough! Entering realm: %s, smoked count reset to 0",
-                                 REALM_TIERS[g_vape.realm_id].title);
-                    }
-
-                    nvs_save_smoked_count(g_vape.realm_id, g_vape.current_realm_smoked, g_vape.total_smoked);
+                const rank_info_t *cur_tier = get_current_realm(g_vape.realm_id);
+                if (g_vape.realm_id < 11 && cur_tier->target_count > 0 && g_vape.current_realm_smoked >= cur_tier->target_count) {
+                    g_vape.realm_id++;
+                    g_vape.current_realm_smoked = 0;
+                    ESP_LOGI(TAG, "Breakthrough! Entering realm: %s", REALM_TIERS[g_vape.realm_id].title);
                 }
+
+                nvs_save_smoked_count(g_vape.realm_id, g_vape.current_realm_smoked, g_vape.total_smoked);
             }
         }
 
