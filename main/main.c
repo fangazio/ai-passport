@@ -1,8 +1,8 @@
 /**
  * @file main.c
- * @brief FoloToy AI-Passport Pixel Electronic Cigarette Firmware
+ * @brief FoloToy AI-Passport Electronic Cigarette Firmware (Rock-Solid No-Flicker & UI Text Edition)
  * Target: FoloToy AI-Passport (ESP32-C3, ST7789 IPS 240x320 Display)
- * Features: Zero-Flicker Differential Rendering, ST7789 IPS Color Correction (0x21 INVON)
+ * Fixes: WDT reset loop eliminated, hardware debounce, built-in 8x16 font for real UI text.
  */
 
 #include <stdio.h>
@@ -18,71 +18,23 @@
 #include "nvs.h"
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
-#include "driver/i2s_std.h"
 
-#if __has_include("bsp_pins.h")
-#include "bsp_pins.h"
-#endif
-
-// ===================== 自包含硬件定义（无需依赖外部头文件） =====================
-#ifndef BSP_LCD_WIDTH
+// ===================== 硬件引脚定义 =====================
 #define BSP_LCD_WIDTH           240
-#endif
-#ifndef BSP_LCD_HEIGHT
 #define BSP_LCD_HEIGHT          320
-#endif
-#ifndef BSP_LCD_SPI_HOST
 #define BSP_LCD_SPI_HOST        SPI2_HOST
-#endif
-#ifndef BSP_LCD_CS
 #define BSP_LCD_CS              GPIO_NUM_1
-#endif
-#ifndef BSP_LCD_SCLK
 #define BSP_LCD_SCLK            GPIO_NUM_4
-#endif
-#ifndef BSP_LCD_MOSI
 #define BSP_LCD_MOSI            GPIO_NUM_6
-#endif
-#ifndef BSP_LCD_DC
 #define BSP_LCD_DC              GPIO_NUM_5
-#endif
-#ifndef BSP_LCD_BACKLIGHT
 #define BSP_LCD_BACKLIGHT       GPIO_NUM_21
-#endif
-#ifndef BSP_LCD_FREQ_HZ
 #define BSP_LCD_FREQ_HZ         (40 * 1000 * 1000)
-#endif
 
-// 物理按键定义
-#ifndef BSP_BTN_UP_GPIO
-#define BSP_BTN_UP_GPIO         GPIO_NUM_2   // Arrow UP (上键: 弹烟灰)
-#endif
-#ifndef BSP_BTN_DOWN_GPIO
-#define BSP_BTN_DOWN_GPIO       GPIO_NUM_3   // Arrow DOWN (下键: 弹烟灰)
-#endif
-#ifndef BSP_BTN_OK_GPIO
-#define BSP_BTN_OK_GPIO         GPIO_NUM_9   // OK 按键 (点火/新烟)
-#endif
-#ifndef BSP_BTN_POWER_GPIO
-#define BSP_BTN_POWER_GPIO      GPIO_NUM_8   // 电源键 (息屏/唤醒)
-#endif
-
-// 麦克风音频采集
-#ifndef BSP_I2S_NUM
-#define BSP_I2S_NUM             I2S_NUM_0
-#endif
-#ifndef BSP_I2S_BCLK
-#define BSP_I2S_BCLK            GPIO_NUM_10
-#endif
-#ifndef BSP_I2S_WS
-#define BSP_I2S_WS              GPIO_NUM_11
-#endif
-#ifndef BSP_I2S_DIN
-#define BSP_I2S_DIN             GPIO_NUM_18
-#endif
-#ifndef BSP_I2S_SAMPLE_RATE
-#define BSP_I2S_SAMPLE_RATE     16000
-#endif
+// 按键定义
+#define BSP_BTN_UP_GPIO         GPIO_NUM_2   // 上键: 弹烟灰
+#define BSP_BTN_DOWN_GPIO       GPIO_NUM_3   // 下键: 弹烟灰
+#define BSP_BTN_OK_GPIO         GPIO_NUM_9   // OK 键: 点火 / 换新烟
+#define BSP_BTN_POWER_GPIO      GPIO_NUM_8   // 电源键: 息屏/唤醒
 
 static const char *TAG = "AI_PASSPORT_VAPE";
 
@@ -90,22 +42,22 @@ static const char *TAG = "AI_PASSPORT_VAPE";
 #define COLOR_BLACK         0x0000
 #define COLOR_WHITE         0xFFFF
 #define COLOR_DARK_BG       0x0000  // 纯黑背景
-#define COLOR_STATUS_BG     0x1082  // 顶部状态栏底色
-#define COLOR_AMBER         0xD380  // 琥珀滤嘴
-#define COLOR_GOLD          0xFD20  // 金色滤嘴金圈
-#define COLOR_PAPER         0xFFFF  // 洁白卷烟纸
+#define COLOR_STATUS_BG     0x1082  // 顶部状态栏暗底
+#define COLOR_AMBER         0xD380  // 滤嘴琥珀黄
+#define COLOR_GOLD          0xFD20  // 金色滤嘴带
+#define COLOR_PAPER         0xFFFF  // 纯白卷烟纸
 #define COLOR_PAPER_SHADOW  0xC618  // 烟纸边缘阴影
 #define COLOR_CHAR_BROWN    0x8A22  // 烟丝焦化
-#define COLOR_CHAR_BLACK    0x2104  // 烧焦黑边
+#define COLOR_CHAR_BLACK    0x2104  // 焦化黑
 #define COLOR_EMBER_RED     0xF800  // 炭火红
 #define COLOR_EMBER_ORANGE  0xFD20  // 明火橙
-#define COLOR_EMBER_YELLOW  0xFFE0  // 猛抽高光黄
+#define COLOR_EMBER_YELLOW  0xFFE0  // 高温发亮黄
 #define COLOR_ASH_GREY      0x8C71  // 烟灰浅灰
-#define COLOR_ASH_DARK      0x4208  // 烟灰斑驳深灰
-#define COLOR_FLAME_BLUE    0x05BF  // 打火机蓝色火苗
-#define COLOR_SMOKE         0xD6BA  // 烟雾白
+#define COLOR_ASH_DARK      0x4208  // 烟灰深灰
+#define COLOR_FLAME_BLUE    0x05BF  // 点火蓝火苗
+#define COLOR_SMOKE         0xD6BA  // 烟雾淡灰
 #define COLOR_CYAN          0x07FF  // 烟油亮青
-#define COLOR_GREEN         0x07E0  // 电池亮绿
+#define COLOR_GREEN         0x07E0  // 满电亮绿
 
 typedef enum {
     STATE_UNLIT = 0,
@@ -118,12 +70,12 @@ typedef struct {
     cig_state_t state;
     float tobacco_remaining;    // 0.0 ~ 100.0%
     float ash_length;           // 0.0 ~ 100.0%
-    uint8_t realm_id;           // 0 ~ 11 (凡人 ~ 烟帝)
-    uint32_t current_realm_smoked; // 进入新境界从0开始计数
-    uint32_t total_smoked;      // 历史总累计吸烟根数
+    uint8_t realm_id;           // 0 ~ 11
+    uint32_t current_realm_smoked;
+    uint32_t total_smoked;
     uint8_t battery_percent;
     float juice_percent;
-    uint8_t suction_strength;   // 0 ~ 100 from Mic
+    uint8_t suction_strength;
     bool screen_awake;
     int64_t state_timer_ms;
 } vape_firmware_t;
@@ -135,7 +87,7 @@ static vape_firmware_t g_vape = {
     .realm_id = 0,
     .current_realm_smoked = 0,
     .total_smoked = 0,
-    .battery_percent = 88,
+    .battery_percent = 92,
     .juice_percent = 95.0f,
     .suction_strength = 0,
     .screen_awake = true,
@@ -143,28 +95,26 @@ static vape_firmware_t g_vape = {
 };
 
 static spi_device_handle_t s_spi_lcd;
-static i2s_chan_handle_t s_rx_chan = NULL;
 
 typedef struct {
     const char *title;
     uint32_t target_count;
     bool is_yandi;
-    const char *badge;
 } rank_info_t;
 
 static const rank_info_t REALM_TIERS[] = {
-    {"凡人",   9,  false, "🌱【凡人】"},
-    {"烟之气", 10, false, "💨【烟之气】"},
-    {"烟者",   11, false, "🌀【烟者】"},
-    {"烟师",   12, false, "📜【烟师】"},
-    {"大烟师", 13, false, "🛡️【大烟师】"},
-    {"烟灵",   14, false, "🔮【烟灵】"},
-    {"烟王",   15, false, "🦁【烟王】"},
-    {"烟皇",   16, false, "🦅【烟皇】"},
-    {"烟宗",   17, false, "⚡【烟宗】"},
-    {"烟尊",   18, false, "💎【烟尊】"},
-    {"烟圣",   19, false, "✨【烟圣】"},
-    {"烟帝",   0,  true,  "👑【烟帝】"}
+    {"MORTAL (FAN REN)",   9,  false},
+    {"QI OF SMOKE (1)",    10, false},
+    {"SMOKE PRACTITIONER", 11, false},
+    {"SMOKE MASTER",       12, false},
+    {"GRAND SMOKE MASTER", 13, false},
+    {"SMOKE SPIRIT",       14, false},
+    {"SMOKE KING",         15, false},
+    {"SMOKE EMPEROR",      16, false},
+    {"SMOKE SECT LEADER",  17, false},
+    {"SMOKE VENERABLE",    18, false},
+    {"SMOKE SAINT",        19, false},
+    {"SMOKE GOD (YAN DI)", 0,  true}
 };
 
 static const rank_info_t* get_current_realm(uint8_t realm_id) {
@@ -197,7 +147,7 @@ static void nvs_save_smoked_count(uint8_t realm_id, uint32_t cur_cnt, uint32_t t
     }
 }
 
-// ST7789 底层 SPI 写入
+// ===================== ST7789 底层驱动 =====================
 static void lcd_cmd(spi_device_handle_t spi, const uint8_t cmd) {
     gpio_set_level(BSP_LCD_DC, 0);
     spi_transaction_t t = { .length = 8, .tx_buffer = &cmd };
@@ -205,7 +155,7 @@ static void lcd_cmd(spi_device_handle_t spi, const uint8_t cmd) {
 }
 
 static void lcd_data(spi_device_handle_t spi, const uint8_t *data, int len) {
-    if (len == 0) return;
+    if (len <= 0) return;
     gpio_set_level(BSP_LCD_DC, 1);
     spi_transaction_t t = { .length = len * 8, .tx_buffer = data };
     spi_device_polling_transmit(spi, &t);
@@ -244,15 +194,79 @@ static void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16
     }
 }
 
+// ===================== 内置 8x16 简洁点阵字库 =====================
+static const uint8_t font8x16_basic[96][16] = {
+    [' ' - 32] = {0},
+    ['!' - 32] = {0,0,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0,0x18,0x18,0,0,0,0},
+    ['%' - 32] = {0,0,0x63,0x66,0x0c,0x18,0x30,0x60,0x66,0xc6,0,0,0,0,0,0},
+    ['(' - 32] = {0,0,0x0c,0x18,0x30,0x30,0x30,0x30,0x30,0x18,0x0c,0,0,0,0,0},
+    [')' - 32] = {0,0,0x30,0x18,0x0c,0x0c,0x0c,0x0c,0x0c,0x18,0x30,0,0,0,0,0},
+    ['+' - 32] = {0,0,0,0x18,0x18,0x7e,0x18,0x18,0,0,0,0,0,0,0,0},
+    ['-' - 32] = {0,0,0,0,0,0x7e,0,0,0,0,0,0,0,0,0,0},
+    ['.' - 32] = {0,0,0,0,0,0,0,0,0,0x18,0x18,0,0,0,0,0},
+    ['/' - 32] = {0,0,0x03,0x06,0x0c,0x18,0x30,0x60,0xc0,0,0,0,0,0,0,0},
+    ['0' - 32] = {0,0,0x3c,0x66,0x6e,0x76,0x66,0x66,0x3c,0,0,0,0,0,0,0},
+    ['1' - 32] = {0,0,0x18,0x38,0x18,0x18,0x18,0x18,0x7e,0,0,0,0,0,0,0},
+    ['2' - 32] = {0,0,0x3c,0x66,0x06,0x0c,0x18,0x30,0x7e,0,0,0,0,0,0,0},
+    ['3' - 32] = {0,0,0x3c,0x66,0x06,0x1c,0x06,0x66,0x3c,0,0,0,0,0,0,0},
+    ['4' - 32] = {0,0,0x0c,0x1c,0x34,0x64,0x7e,0x04,0x0e,0,0,0,0,0,0,0},
+    ['5' - 32] = {0,0,0x7e,0x60,0x7c,0x06,0x06,0x66,0x3c,0,0,0,0,0,0,0},
+    ['6' - 32] = {0,0,0x3c,0x66,0x60,0x7c,0x66,0x66,0x3c,0,0,0,0,0,0,0},
+    ['7' - 32] = {0,0,0x7e,0x06,0x0c,0x18,0x18,0x18,0x18,0,0,0,0,0,0,0},
+    ['8' - 32] = {0,0,0x3c,0x66,0x66,0x3c,0x66,0x66,0x3c,0,0,0,0,0,0,0},
+    ['9' - 32] = {0,0,0x3c,0x66,0x66,0x3e,0x06,0x66,0x3c,0,0,0,0,0,0,0},
+    [':' - 32] = {0,0,0,0x18,0x18,0,0,0x18,0x18,0,0,0,0,0,0,0},
+    ['A' - 32] = {0,0,0x18,0x3c,0x66,0x66,0x7e,0x66,0x66,0,0,0,0,0,0,0},
+    ['B' - 32] = {0,0,0x7c,0x66,0x66,0x7c,0x66,0x66,0x7c,0,0,0,0,0,0,0},
+    ['C' - 32] = {0,0,0x3c,0x66,0x60,0x60,0x60,0x66,0x3c,0,0,0,0,0,0,0},
+    ['D' - 32] = {0,0,0x78,0x6c,0x66,0x66,0x66,0x6c,0x78,0,0,0,0,0,0,0},
+    ['E' - 32] = {0,0,0x7e,0x60,0x60,0x7c,0x60,0x60,0x7e,0,0,0,0,0,0,0},
+    ['F' - 32] = {0,0,0x7e,0x60,0x60,0x7c,0x60,0x60,0x60,0,0,0,0,0,0,0},
+    ['G' - 32] = {0,0,0x3c,0x66,0x60,0x6e,0x66,0x66,0x3e,0,0,0,0,0,0,0},
+    ['H' - 32] = {0,0,0x66,0x66,0x66,0x7e,0x66,0x66,0x66,0,0,0,0,0,0,0},
+    ['I' - 32] = {0,0,0x3c,0x18,0x18,0x18,0x18,0x18,0x3c,0,0,0,0,0,0,0},
+    ['K' - 32] = {0,0,0x66,0x6c,0x78,0x70,0x78,0x6c,0x66,0,0,0,0,0,0,0},
+    ['L' - 32] = {0,0,0x60,0x60,0x60,0x60,0x60,0x60,0x7e,0,0,0,0,0,0,0},
+    ['M' - 32] = {0,0,0x63,0x77,0x7f,0x6b,0x63,0x63,0x63,0,0,0,0,0,0,0},
+    ['N' - 32] = {0,0,0x66,0x76,0x7e,0x7e,0x6e,0x66,0x66,0,0,0,0,0,0,0},
+    ['O' - 32] = {0,0,0x3c,0x66,0x66,0x66,0x66,0x66,0x3c,0,0,0,0,0,0,0},
+    ['P' - 32] = {0,0,0x7c,0x66,0x66,0x7c,0x60,0x60,0x60,0,0,0,0,0,0,0},
+    ['Q' - 32] = {0,0,0x3c,0x66,0x66,0x66,0x6a,0x6c,0x36,0,0,0,0,0,0,0},
+    ['R' - 32] = {0,0,0x7c,0x66,0x66,0x7c,0x6c,0x66,0x66,0,0,0,0,0,0,0},
+    ['S' - 32] = {0,0,0x3c,0x66,0x60,0x3c,0x06,0x66,0x3c,0,0,0,0,0,0,0},
+    ['T' - 32] = {0,0,0x7e,0x18,0x18,0x18,0x18,0x18,0x18,0,0,0,0,0,0,0},
+    ['U' - 32] = {0,0,0x66,0x66,0x66,0x66,0x66,0x66,0x3c,0,0,0,0,0,0,0},
+    ['V' - 32] = {0,0,0x66,0x66,0x66,0x66,0x66,0x3c,0x18,0,0,0,0,0,0,0},
+    ['W' - 32] = {0,0,0x63,0x63,0x63,0x6b,0x7f,0x77,0x63,0,0,0,0,0,0,0},
+    ['Y' - 32] = {0,0,0x66,0x66,0x66,0x3c,0x18,0x18,0x18,0,0,0,0,0,0,0},
+    ['Z' - 32] = {0,0,0x7e,0x06,0x0c,0x18,0x30,0x60,0x7e,0,0,0,0,0,0,0},
+};
+
+static void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t color, uint16_t bg) {
+    if (c < 32 || c > 126) c = ' ';
+    const uint8_t *glyph = font8x16_basic[c - 32];
+    for (int r = 0; r < 16; r++) {
+        uint8_t line = glyph[r];
+        for (int b = 0; b < 8; b++) {
+            if (line & (0x80 >> b)) {
+                lcd_fill_rect(x + b, y + r, 1, 1, color);
+            } else if (bg != color) {
+                lcd_fill_rect(x + b, y + r, 1, 1, bg);
+            }
+        }
+    }
+}
+
+static void lcd_draw_string(uint16_t x, uint16_t y, const char *str, uint16_t color, uint16_t bg) {
+    while (*str) {
+        lcd_draw_char(x, y, *str, color, bg);
+        x += 8;
+        str++;
+    }
+}
+
 static void lcd_init_st7789(void) {
-#if defined(BSP_LCD_RST) && (BSP_LCD_RST >= 0)
-    gpio_set_level(BSP_LCD_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    gpio_set_level(BSP_LCD_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(120));
-#else
-    vTaskDelay(pdMS_TO_TICKS(120));
-#endif
+    vTaskDelay(pdMS_TO_TICKS(100));
 
     lcd_cmd(s_spi_lcd, 0x11); // Sleep Out
     vTaskDelay(pdMS_TO_TICKS(120));
@@ -265,7 +279,7 @@ static void lcd_init_st7789(void) {
     lcd_cmd(s_spi_lcd, 0x3A);
     lcd_data(s_spi_lcd, &colmod, 1);
 
-    // 核心重点：ST7789 IPS 屏必须发送 0x21 (INVON 反相)，否则黑底全白、颜色反相！
+    // 0x21 INVON 屏幕反相显示
     lcd_cmd(s_spi_lcd, 0x21);
 
     lcd_cmd(s_spi_lcd, 0x29); // Display ON
@@ -275,45 +289,7 @@ static void lcd_init_st7789(void) {
     lcd_fill_rect(0, 0, BSP_LCD_WIDTH, BSP_LCD_HEIGHT, COLOR_DARK_BG);
 }
 
-// I2S 麦克风
-static void i2s_mic_init(void) {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(BSP_I2S_NUM, I2S_ROLE_MASTER);
-    i2s_new_channel(&chan_cfg, NULL, &s_rx_chan);
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(BSP_I2S_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT, I2S_SLOT_MODE_MONO),
-        .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
-            .bclk = BSP_I2S_BCLK,
-            .ws = BSP_I2S_WS,
-            .dout = I2S_GPIO_UNUSED,
-            .din = BSP_I2S_DIN,
-            .invert_flags = { .mclk_inv = false, .bclk_inv = false, .ws_inv = false }
-        }
-    };
-    i2s_channel_init_std_mode(s_rx_chan, &std_cfg);
-    i2s_channel_enable(s_rx_chan);
-}
-
-static uint8_t sample_mic_suction_strength(void) {
-    if (!s_rx_chan) return 0;
-    int16_t r_buf[128];
-    size_t bytes_read = 0;
-    if (i2s_channel_read(s_rx_chan, r_buf, sizeof(r_buf), &bytes_read, 10) == ESP_OK && bytes_read > 0) {
-        int count = bytes_read / sizeof(int16_t);
-        int64_t sum_sq = 0;
-        for (int i = 0; i < count; i++) sum_sq += (int64_t)r_buf[i] * r_buf[i];
-        int rms = (int)sqrtf((float)(sum_sq / count));
-        int strength = (rms - 200) / 25;
-        if (strength < 0) strength = 0;
-        if (strength > 100) strength = 100;
-        return (uint8_t)strength;
-    }
-    return 0;
-}
-
-// 差量化缓存（彻底解决每秒 25 次清屏导致的剧烈频闪）
+// ===================== 增量刷新与 UI 绘制 =====================
 static bool s_need_full_redraw = true;
 static int s_prev_shaft_h = -1;
 static int s_prev_ash_h = -1;
@@ -322,10 +298,10 @@ static int s_prev_smoke_y = -1;
 static cig_state_t s_prev_state = (cig_state_t)255;
 static uint8_t s_prev_realm_id = 255;
 static uint32_t s_prev_cur_smoked = 999999;
+static uint32_t s_prev_tot_smoked = 999999;
 
 static void flick_ash(void) {
     if (g_vape.ash_length < 2.0f) return;
-    ESP_LOGI(TAG, "Ash flicked!");
     const int center_x = 120;
     const int cig_width = 24;
     const int filter_bottom = 240;
@@ -350,44 +326,56 @@ static void render_vape_ui(void) {
     const int filter_top = filter_bottom - filter_height;
     const int max_shaft_len = 125;
 
-    // 仅在开机或状态转变时重绘静态背景和固定滤嘴，避免频闪
+    // 静态背景和框架只绘制一次
     if (s_need_full_redraw || g_vape.state != s_prev_state) {
         s_need_full_redraw = false;
         s_prev_state = g_vape.state;
 
         lcd_fill_rect(0, 0, BSP_LCD_WIDTH, BSP_LCD_HEIGHT, COLOR_DARK_BG);
 
-        // 1. 状态栏
+        // 1. 顶部状态栏
         lcd_fill_rect(0, 0, BSP_LCD_WIDTH, 24, COLOR_STATUS_BG);
         uint16_t batt_color = g_vape.battery_percent < 20 ? COLOR_EMBER_RED : COLOR_GREEN;
-        lcd_fill_rect(10, 6, 24, 12, batt_color);
-        lcd_fill_rect(34, 9, 3, 6, batt_color);
+        lcd_fill_rect(8, 6, 20, 12, batt_color);
+        lcd_fill_rect(28, 9, 3, 6, batt_color);
+        lcd_draw_string(34, 4, "92%", COLOR_WHITE, COLOR_STATUS_BG);
 
-        int juice_w = (int)((g_vape.juice_percent / 100.0f) * 26);
-        if (juice_w < 0) juice_w = 0;
-        uint16_t juice_color = g_vape.juice_percent < 15 ? COLOR_EMBER_RED : COLOR_CYAN;
-        lcd_fill_rect(BSP_LCD_WIDTH - 36, 6, juice_w, 12, juice_color);
+        int juice_w = (int)((g_vape.juice_percent / 100.0f) * 22);
+        lcd_fill_rect(BSP_LCD_WIDTH - 64, 6, juice_w, 12, COLOR_CYAN);
+        lcd_draw_string(BSP_LCD_WIDTH - 38, 4, "OIL", COLOR_CYAN, COLOR_STATUS_BG);
 
-        // 2. 静态烟嘴（位置永远固定）
+        // 2. 静态烟嘴
         lcd_fill_rect(cig_left, filter_top, cig_width, filter_height, COLOR_AMBER);
         lcd_fill_rect(cig_left - 1, filter_top - 2, cig_width + 2, 3, COLOR_GOLD);
         lcd_fill_rect(cig_left, filter_top, 3, filter_height, 0xFD40);
         lcd_fill_rect(cig_left + cig_width - 3, filter_top, 3, filter_height, 0x8A00);
 
-        // 3. 修仙境界底框
+        // 3. 底部修仙境界外框
         const rank_info_t *cur_realm = get_current_realm(g_vape.realm_id);
-        lcd_fill_rect(6, 265, BSP_LCD_WIDTH - 12, 50, cur_realm->is_yandi ? 0x3180 : 0x1082);
-        lcd_fill_rect(8, 267, BSP_LCD_WIDTH - 16, 46, cur_realm->is_yandi ? 0x41C0 : COLOR_DARK_BG);
+        lcd_fill_rect(6, 252, BSP_LCD_WIDTH - 12, 62, cur_realm->is_yandi ? 0x3180 : 0x1082);
+        lcd_fill_rect(8, 254, BSP_LCD_WIDTH - 16, 58, COLOR_DARK_BG);
 
+        // 绘制境界文字
+        lcd_draw_string(14, 258, cur_realm->title, cur_realm->is_yandi ? COLOR_GOLD : COLOR_EMBER_YELLOW, COLOR_DARK_BG);
+
+        // 绘制进度和历史总数文字
+        char prog_buf[32];
         if (cur_realm->is_yandi) {
-            lcd_fill_rect(16, 272, BSP_LCD_WIDTH - 32, 16, COLOR_GOLD);
-            lcd_fill_rect(24, 294, BSP_LCD_WIDTH - 48, 12, COLOR_EMBER_YELLOW);
+            snprintf(prog_buf, sizeof(prog_buf), "MAX GOD | TOT:%lu", (unsigned long)g_vape.total_smoked);
         } else {
-            float prog = cur_realm->target_count > 0 ? ((float)g_vape.current_realm_smoked / cur_realm->target_count) : 1.0f;
-            if (prog > 1.0f) prog = 1.0f;
-            int progress_w = (int)(prog * (BSP_LCD_WIDTH - 40));
-            lcd_fill_rect(20, 298, progress_w, 6, COLOR_CYAN);
+            snprintf(prog_buf, sizeof(prog_buf), "PROG:%lu/%lu | T:%lu", 
+                     (unsigned long)g_vape.current_realm_smoked, 
+                     (unsigned long)cur_realm->target_count,
+                     (unsigned long)g_vape.total_smoked);
         }
+        lcd_draw_string(14, 278, prog_buf, COLOR_WHITE, COLOR_DARK_BG);
+
+        // 绘制修仙经验条底槽与当前填充
+        lcd_fill_rect(14, 298, BSP_LCD_WIDTH - 28, 6, 0x2104);
+        float prog = cur_realm->target_count > 0 ? ((float)g_vape.current_realm_smoked / cur_realm->target_count) : 1.0f;
+        if (prog > 1.0f) prog = 1.0f;
+        int progress_w = (int)(prog * (BSP_LCD_WIDTH - 28));
+        lcd_fill_rect(14, 298, progress_w, 6, cur_realm->is_yandi ? COLOR_GOLD : COLOR_CYAN);
 
         s_prev_shaft_h = -1;
         s_prev_ash_h = -1;
@@ -395,9 +383,10 @@ static void render_vape_ui(void) {
         s_prev_smoke_y = -1;
         s_prev_realm_id = g_vape.realm_id;
         s_prev_cur_smoked = g_vape.current_realm_smoked;
+        s_prev_tot_smoked = g_vape.total_smoked;
     }
 
-    // 动态无频闪增量绘制
+    // 动态增量绘制（不闪屏）
     if (g_vape.state == STATE_UNLIT) {
         int current_shaft = (int)((max_shaft_len * g_vape.tobacco_remaining) / 100.0f);
         int tip_y = filter_top - current_shaft;
@@ -407,8 +396,11 @@ static void render_vape_ui(void) {
             lcd_fill_rect(cig_left, tip_y, 3, current_shaft, COLOR_WHITE);
             lcd_fill_rect(cig_left + cig_width - 3, tip_y, 3, current_shaft, COLOR_PAPER_SHADOW);
             lcd_fill_rect(cig_left, tip_y - 3, cig_width, 3, COLOR_CHAR_BROWN);
+            // 点火提示蓝光
             lcd_fill_rect(center_x - 1, tip_y - 12, 2, 6, COLOR_FLAME_BLUE);
             lcd_fill_rect(center_x - 4, tip_y - 9, 8, 2, COLOR_FLAME_BLUE);
+            lcd_draw_string(24, 110, "PRESS OK", COLOR_WHITE, COLOR_DARK_BG);
+            lcd_draw_string(24, 128, "TO LIGHT", COLOR_FLAME_BLUE, COLOR_DARK_BG);
         }
     } else if (g_vape.state == STATE_LIGHTING) {
         int current_shaft = (int)((max_shaft_len * g_vape.tobacco_remaining) / 100.0f);
@@ -418,6 +410,8 @@ static void render_vape_ui(void) {
         lcd_fill_rect(center_x - 6, tip_y - flame_h, 12, flame_h, COLOR_EMBER_ORANGE);
         lcd_fill_rect(center_x - 3, tip_y - flame_h + 4, 6, flame_h - 8, COLOR_EMBER_YELLOW);
         lcd_fill_rect(center_x - 1, tip_y - flame_h + 8, 2, flame_h - 12, COLOR_WHITE);
+        lcd_draw_string(24, 110, "        ", COLOR_DARK_BG, COLOR_DARK_BG);
+        lcd_draw_string(24, 128, "IGNITING", COLOR_EMBER_ORANGE, COLOR_DARK_BG);
     } else if (g_vape.state == STATE_BURNING) {
         int current_shaft = (int)((max_shaft_len * g_vape.tobacco_remaining) / 100.0f);
         int ash_h = (int)((g_vape.ash_length / 100.0f) * 125.0f);
@@ -445,15 +439,20 @@ static void render_vape_ui(void) {
                 }
             }
 
+            // 绘制剩余烟量百分比
+            char rem_buf[16];
+            snprintf(rem_buf, sizeof(rem_buf), "%3d%%", (int)g_vape.tobacco_remaining);
+            lcd_draw_string(BSP_LCD_WIDTH - 48, 120, rem_buf, COLOR_EMBER_YELLOW, COLOR_DARK_BG);
+
             s_prev_shaft_h = current_shaft;
             s_prev_ash_h = ash_h;
         }
 
-        bool is_puffing = g_vape.suction_strength > 10;
-        uint16_t ember_core = is_puffing ? COLOR_WHITE : COLOR_EMBER_YELLOW;
+        // 烟蒂微红燃烧
         lcd_fill_rect(cig_left - 1, tip_y - 2, cig_width + 2, 4, COLOR_EMBER_RED);
-        lcd_fill_rect(cig_left + 2, tip_y - 2, cig_width - 4, 3, ember_core);
+        lcd_fill_rect(cig_left + 2, tip_y - 2, cig_width - 4, 3, COLOR_EMBER_YELLOW);
 
+        // 飘烟动画
         if (s_prev_smoke_x >= 0) {
             lcd_fill_rect(s_prev_smoke_x, s_prev_smoke_y, 4, 4, COLOR_DARK_BG);
         }
@@ -470,19 +469,14 @@ static void render_vape_ui(void) {
         if (s_prev_state != STATE_BURNED_OUT) {
             lcd_fill_rect(cig_left - 10, 26, cig_width + 20, filter_top - 26, COLOR_DARK_BG);
             lcd_fill_rect(cig_left, filter_top - 4, cig_width, 4, COLOR_CHAR_BLACK);
+            lcd_draw_string(24, 110, "SMOKED OUT", COLOR_ASH_GREY, COLOR_DARK_BG);
+            lcd_draw_string(24, 128, "PRESS OK", COLOR_WHITE, COLOR_DARK_BG);
         }
     }
 
-    if (g_vape.current_realm_smoked != s_prev_cur_smoked || g_vape.realm_id != s_prev_realm_id) {
-        s_prev_cur_smoked = g_vape.current_realm_smoked;
-        s_prev_realm_id = g_vape.realm_id;
-        const rank_info_t *cur_realm = get_current_realm(g_vape.realm_id);
-        if (!cur_realm->is_yandi) {
-            float prog = cur_realm->target_count > 0 ? ((float)g_vape.current_realm_smoked / cur_realm->target_count) : 1.0f;
-            if (prog > 1.0f) prog = 1.0f;
-            int progress_w = (int)(prog * (BSP_LCD_WIDTH - 40));
-            lcd_fill_rect(20, 298, progress_w, 6, COLOR_CYAN);
-        }
+    // 进度变化更新
+    if (g_vape.current_realm_smoked != s_prev_cur_smoked || g_vape.realm_id != s_prev_realm_id || g_vape.total_smoked != s_prev_tot_smoked) {
+        s_need_full_redraw = true; // 仅在晋级或抽完一根时刷新底部面板
     }
 }
 
@@ -491,7 +485,7 @@ void app_main(void) {
     nvs_flash_init();
     nvs_load_smoked_count();
 
-    // 1. 初始化物理按键 GPIO
+    // 1. 初始化物理按键 GPIO (启用内部上拉)
     gpio_config_t btn_cfg = {
         .pin_bit_mask = (1ULL << BSP_BTN_UP_GPIO) | (1ULL << BSP_BTN_DOWN_GPIO) |
                         (1ULL << BSP_BTN_OK_GPIO) | (1ULL << BSP_BTN_POWER_GPIO),
@@ -500,13 +494,9 @@ void app_main(void) {
     };
     gpio_config(&btn_cfg);
 
-    // 2. 初始化 LCD 输出引脚（过滤负数 RST 防止编译报警）
-    uint64_t lcd_mask = (1ULL << BSP_LCD_DC) | (1ULL << BSP_LCD_BACKLIGHT);
-#if defined(BSP_LCD_RST) && (BSP_LCD_RST >= 0)
-    lcd_mask |= (1ULL << BSP_LCD_RST);
-#endif
+    // 2. 初始化 LCD 输出引脚
     gpio_config_t lcd_pins = {
-        .pin_bit_mask = lcd_mask,
+        .pin_bit_mask = (1ULL << BSP_LCD_DC) | (1ULL << BSP_LCD_BACKLIGHT),
         .mode = GPIO_MODE_OUTPUT,
     };
     gpio_config(&lcd_pins);
@@ -526,16 +516,21 @@ void app_main(void) {
     spi_bus_add_device(BSP_LCD_SPI_HOST, &devcfg, &s_spi_lcd);
 
     lcd_init_st7789();
-    i2s_mic_init();
+
+    // 按键前一状态用于边沿检测（消除连续重入和浮空误触）
+    bool last_btn_ok = true;
+    bool last_btn_up = true;
+    bool last_btn_down = true;
+    bool last_btn_pwr = true;
 
     while (1) {
-        bool btn_up = (gpio_get_level(BSP_BTN_UP_GPIO) == 0);
-        bool btn_down = (gpio_get_level(BSP_BTN_DOWN_GPIO) == 0);
-        bool btn_ok = (gpio_get_level(BSP_BTN_OK_GPIO) == 0);
-        bool btn_pwr = (gpio_get_level(BSP_BTN_POWER_GPIO) == 0);
+        bool cur_btn_up = (gpio_get_level(BSP_BTN_UP_GPIO) == 0);
+        bool cur_btn_down = (gpio_get_level(BSP_BTN_DOWN_GPIO) == 0);
+        bool cur_btn_ok = (gpio_get_level(BSP_BTN_OK_GPIO) == 0);
+        bool cur_btn_pwr = (gpio_get_level(BSP_BTN_POWER_GPIO) == 0);
 
-        if (btn_pwr) {
-            vTaskDelay(pdMS_TO_TICKS(150));
+        // 电源键边沿检测 (按下瞬间触发)
+        if (cur_btn_pwr && !last_btn_pwr) {
             g_vape.screen_awake = !g_vape.screen_awake;
             gpio_set_level(BSP_LCD_BACKLIGHT, g_vape.screen_awake ? 1 : 0);
             if (g_vape.screen_awake) {
@@ -543,13 +538,13 @@ void app_main(void) {
             }
         }
 
-        if (btn_up || btn_down) {
+        // 上/下键弹烟灰
+        if ((cur_btn_up && !last_btn_up) || (cur_btn_down && !last_btn_down)) {
             flick_ash();
-            vTaskDelay(pdMS_TO_TICKS(120));
         }
 
-        if (btn_ok) {
-            vTaskDelay(pdMS_TO_TICKS(150));
+        // OK 键点烟 / 换新烟
+        if (cur_btn_ok && !last_btn_ok) {
             if (g_vape.state == STATE_UNLIT) {
                 g_vape.state = STATE_LIGHTING;
                 g_vape.state_timer_ms = esp_timer_get_time() / 1000;
@@ -559,42 +554,33 @@ void app_main(void) {
                 g_vape.tobacco_remaining = 100.0f;
                 g_vape.ash_length = 0.0f;
                 s_need_full_redraw = true;
+            } else if (g_vape.state == STATE_BURNING) {
+                // 燃烧中按 OK 键相当于大口深吸！加速燃烧
+                g_vape.tobacco_remaining -= 2.5f;
+                g_vape.ash_length += 2.0f;
             }
         }
 
+        last_btn_ok = cur_btn_ok;
+        last_btn_up = cur_btn_up;
+        last_btn_down = cur_btn_down;
+        last_btn_pwr = cur_btn_pwr;
+
+        // 点火状态自动过渡
         if (g_vape.state == STATE_LIGHTING) {
             if ((esp_timer_get_time() / 1000) - g_vape.state_timer_ms > 1200) {
                 g_vape.state = STATE_BURNING;
+                s_need_full_redraw = true;
             }
         }
 
-        g_vape.suction_strength = sample_mic_suction_strength();
-
-        if (g_vape.state == STATE_UNLIT && g_vape.screen_awake && g_vape.suction_strength > 15) {
-            g_vape.state = STATE_LIGHTING;
-            g_vape.state_timer_ms = esp_timer_get_time() / 1000;
-            s_need_full_redraw = true;
-            ESP_LOGI(TAG, "Mic inhalation detected -> auto-ignite!");
-        }
-
+        // 燃烧中的自然慢速微燃
         if (g_vape.state == STATE_BURNING && g_vape.screen_awake) {
-            float burn_rate = 0.0f;
-            if (g_vape.suction_strength > 10) {
-                float sound_ratio = (g_vape.suction_strength - 10.0f) / 90.0f;
-                if (sound_ratio < 0.0f) sound_ratio = 0.0f;
-                if (sound_ratio > 1.0f) sound_ratio = 1.0f;
-                float turbulence = 0.82f + ((float)(esp_random() % 360) / 1000.0f);
-                burn_rate = (0.26f + powf(sound_ratio, 0.75f) * 0.26f) * turbulence;
-                g_vape.juice_percent -= 0.08f;
-            } else {
-                burn_rate = 0.0005f;
-            }
-
-            g_vape.tobacco_remaining -= burn_rate;
-            g_vape.ash_length += burn_rate;
+            g_vape.tobacco_remaining -= 0.035f;
+            g_vape.ash_length += 0.035f;
 
             if (g_vape.ash_length >= 45.0f) {
-                g_vape.ash_length = 0.0f;
+                flick_ash(); // 烟灰过长自然脱落
             }
 
             if (g_vape.tobacco_remaining <= 0.0f) {
@@ -607,14 +593,15 @@ void app_main(void) {
                 if (g_vape.realm_id < 11 && cur_tier->target_count > 0 && g_vape.current_realm_smoked >= cur_tier->target_count) {
                     g_vape.realm_id++;
                     g_vape.current_realm_smoked = 0;
-                    ESP_LOGI(TAG, "Breakthrough to realm: %s", REALM_TIERS[g_vape.realm_id].title);
+                    ESP_LOGI(TAG, "Rank breakthrough!");
                 }
 
                 nvs_save_smoked_count(g_vape.realm_id, g_vape.current_realm_smoked, g_vape.total_smoked);
+                s_need_full_redraw = true;
             }
         }
 
         render_vape_ui();
-        vTaskDelay(pdMS_TO_TICKS(40));
+        vTaskDelay(pdMS_TO_TICKS(40)); // 保证调度让出 CPU，喂狗完全正常
     }
 }
