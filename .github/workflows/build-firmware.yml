@@ -8,10 +8,18 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    container: espressif/idf:release-v5.1
+    container: espressif/idf:release-v5.5
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
+
+      - name: Fix Git Directory Permissions
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory '*'
 
       - name: Build Firmware with ESP-IDF
         run: |
@@ -19,10 +27,23 @@ jobs:
           idf.py set-target esp32c3
           idf.py build
 
-      - name: Merge Binaries into Single Factory Image
+      - name: Merge Binaries into Single Factory Image (0x0 Direct Flash)
         run: |
           . /opt/esp/idf/export.sh
-          esptool.py --chip esp32c3 merge_bin -o build/ai_passport_vape_factory_merged.bin --fill-flash-size 8MB 0x0 build/bootloader/bootloader.bin 0x8000 build/partition_table/partition-table.bin 0x10000 build/ai_passport_vape_firmware.bin
+          if [ -f "build/ai-passport.bin" ]; then
+            APP_BIN="build/ai-passport.bin"
+          elif [ -f "build/ai_passport_vape_firmware.bin" ]; then
+            APP_BIN="build/ai_passport_vape_firmware.bin"
+          else
+            APP_BIN=$(ls build/*.bin | grep -v 'bootloader' | grep -v 'partition' | grep -v 'merged' | head -n 1)
+          fi
+          echo "Selected application binary: $APP_BIN"
+          esptool.py --chip esp32c3 merge_bin \
+            -o build/ai_passport_vape_factory_merged.bin \
+            --fill-flash-size 8MB \
+            0x0 build/bootloader/bootloader.bin \
+            0x8000 build/partition_table/partition-table.bin \
+            0x10000 "$APP_BIN"
 
       - name: Upload Flashable BIN Artifacts
         uses: actions/upload-artifact@v4
@@ -30,6 +51,6 @@ jobs:
           name: ai-passport-vape-firmware-bins
           path: |
             build/ai_passport_vape_factory_merged.bin
-            build/ai_passport_vape_firmware.bin
             build/bootloader/bootloader.bin
             build/partition_table/partition-table.bin
+            build/*.bin
