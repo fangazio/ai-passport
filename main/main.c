@@ -1,13 +1,12 @@
 /**
  * @file main.c
- * @brief FoloToy AI-Passport Electronic Cigarette Firmware (Rock-Solid No-Flicker & UI Text Edition)
+ * @brief FoloToy AI-Passport Electronic Cigarette Firmware (High-Speed Font & Reliable Buttons)
  * Target: FoloToy AI-Passport (ESP32-C3, ST7789 IPS 240x320 Display)
- * Fixes: WDT reset loop eliminated, hardware debounce, built-in 8x16 font for real UI text.
+ * Fixes: Block-buffered 8x16 font rendering, multi-pin button polling + auto-ignition fallback.
  */
 
 #include <stdio.h>
 #include <string.h>
-#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -30,34 +29,34 @@
 #define BSP_LCD_BACKLIGHT       GPIO_NUM_21
 #define BSP_LCD_FREQ_HZ         (40 * 1000 * 1000)
 
-// 按键定义
-#define BSP_BTN_UP_GPIO         GPIO_NUM_2   // 上键: 弹烟灰
-#define BSP_BTN_DOWN_GPIO       GPIO_NUM_3   // 下键: 弹烟灰
-#define BSP_BTN_OK_GPIO         GPIO_NUM_9   // OK 键: 点火 / 换新烟
-#define BSP_BTN_POWER_GPIO      GPIO_NUM_8   // 电源键: 息屏/唤醒
+// 按键引脚定义（涵盖 AI-Passport 常见侧键与 BOOT 键）
+#define BTN_PIN_BOOT            GPIO_NUM_9   // BOOT/OK 键 (核心确定键)
+#define BTN_PIN_UP              GPIO_NUM_2   // 上按键
+#define BTN_PIN_DOWN            GPIO_NUM_3   // 下按键
+#define BTN_PIN_SIDE            GPIO_NUM_0   // 侧边功能键
 
 static const char *TAG = "AI_PASSPORT_VAPE";
 
 // ===================== 颜色常量 (ST7789 IPS RGB565) =====================
 #define COLOR_BLACK         0x0000
 #define COLOR_WHITE         0xFFFF
-#define COLOR_DARK_BG       0x0000  // 纯黑背景
-#define COLOR_STATUS_BG     0x1082  // 顶部状态栏暗底
+#define COLOR_DARK_BG       0x0000  // 纯黑深邃背景
+#define COLOR_STATUS_BG     0x18C3  // 顶部深灰底色
 #define COLOR_AMBER         0xD380  // 滤嘴琥珀黄
-#define COLOR_GOLD          0xFD20  // 金色滤嘴带
-#define COLOR_PAPER         0xFFFF  // 纯白卷烟纸
-#define COLOR_PAPER_SHADOW  0xC618  // 烟纸边缘阴影
-#define COLOR_CHAR_BROWN    0x8A22  // 烟丝焦化
-#define COLOR_CHAR_BLACK    0x2104  // 焦化黑
+#define COLOR_GOLD          0xFD20  // 金圈
+#define COLOR_PAPER         0xFFFF  // 白卷烟纸
+#define COLOR_PAPER_SHADOW  0xC618  // 纸阴影
+#define COLOR_CHAR_BROWN    0x8A22  // 焦化烟丝
+#define COLOR_CHAR_BLACK    0x2104  // 焦黑
 #define COLOR_EMBER_RED     0xF800  // 炭火红
 #define COLOR_EMBER_ORANGE  0xFD20  // 明火橙
 #define COLOR_EMBER_YELLOW  0xFFE0  // 高温发亮黄
 #define COLOR_ASH_GREY      0x8C71  // 烟灰浅灰
 #define COLOR_ASH_DARK      0x4208  // 烟灰深灰
-#define COLOR_FLAME_BLUE    0x05BF  // 点火蓝火苗
-#define COLOR_SMOKE         0xD6BA  // 烟雾淡灰
-#define COLOR_CYAN          0x07FF  // 烟油亮青
-#define COLOR_GREEN         0x07E0  // 满电亮绿
+#define COLOR_FLAME_BLUE    0x05BF  // 蓝火苗
+#define COLOR_SMOKE         0xD6BA  // 烟雾
+#define COLOR_CYAN          0x07FF  // 亮青
+#define COLOR_GREEN         0x07E0  // 亮绿
 
 typedef enum {
     STATE_UNLIT = 0,
@@ -75,7 +74,6 @@ typedef struct {
     uint32_t total_smoked;
     uint8_t battery_percent;
     float juice_percent;
-    uint8_t suction_strength;
     bool screen_awake;
     int64_t state_timer_ms;
 } vape_firmware_t;
@@ -87,9 +85,8 @@ static vape_firmware_t g_vape = {
     .realm_id = 0,
     .current_realm_smoked = 0,
     .total_smoked = 0,
-    .battery_percent = 92,
-    .juice_percent = 95.0f,
-    .suction_strength = 0,
+    .battery_percent = 95,
+    .juice_percent = 98.0f,
     .screen_awake = true,
     .state_timer_ms = 0
 };
@@ -194,7 +191,7 @@ static void lcd_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16
     }
 }
 
-// ===================== 内置 8x16 简洁点阵字库 =====================
+// ===================== 高速整块字符渲染（彻底解决文字不显示） =====================
 static const uint8_t font8x16_basic[96][16] = {
     [' ' - 32] = {0},
     ['!' - 32] = {0,0,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0,0x18,0x18,0,0,0,0},
@@ -216,6 +213,7 @@ static const uint8_t font8x16_basic[96][16] = {
     ['8' - 32] = {0,0,0x3c,0x66,0x66,0x3c,0x66,0x66,0x3c,0,0,0,0,0,0,0},
     ['9' - 32] = {0,0,0x3c,0x66,0x66,0x3e,0x06,0x66,0x3c,0,0,0,0,0,0,0},
     [':' - 32] = {0,0,0,0x18,0x18,0,0,0x18,0x18,0,0,0,0,0,0,0},
+    ['|' - 32] = {0,0,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0x18,0,0,0,0,0},
     ['A' - 32] = {0,0,0x18,0x3c,0x66,0x66,0x7e,0x66,0x66,0,0,0,0,0,0,0},
     ['B' - 32] = {0,0,0x7c,0x66,0x66,0x7c,0x66,0x66,0x7c,0,0,0,0,0,0,0},
     ['C' - 32] = {0,0,0x3c,0x66,0x60,0x60,0x60,0x66,0x3c,0,0,0,0,0,0,0},
@@ -238,28 +236,35 @@ static const uint8_t font8x16_basic[96][16] = {
     ['U' - 32] = {0,0,0x66,0x66,0x66,0x66,0x66,0x66,0x3c,0,0,0,0,0,0,0},
     ['V' - 32] = {0,0,0x66,0x66,0x66,0x66,0x66,0x3c,0x18,0,0,0,0,0,0,0},
     ['W' - 32] = {0,0,0x63,0x63,0x63,0x6b,0x7f,0x77,0x63,0,0,0,0,0,0,0},
+    ['X' - 32] = {0,0,0x66,0x66,0x3c,0x18,0x3c,0x66,0x66,0,0,0,0,0,0,0},
     ['Y' - 32] = {0,0,0x66,0x66,0x66,0x3c,0x18,0x18,0x18,0,0,0,0,0,0,0},
     ['Z' - 32] = {0,0,0x7e,0x06,0x0c,0x18,0x30,0x60,0x7e,0,0,0,0,0,0,0},
 };
 
-static void lcd_draw_char(uint16_t x, uint16_t y, char c, uint16_t color, uint16_t bg) {
+static void lcd_draw_char_fast(uint16_t x, uint16_t y, char c, uint16_t color, uint16_t bg) {
+    if (x + 8 > BSP_LCD_WIDTH || y + 16 > BSP_LCD_HEIGHT) return;
     if (c < 32 || c > 126) c = ' ';
+
     const uint8_t *glyph = font8x16_basic[c - 32];
+    uint16_t pixel_buf[128]; // 8x16 连续显存块
+    uint16_t color_be = (color >> 8) | (color << 8);
+    uint16_t bg_be = (bg >> 8) | (bg << 8);
+
+    int idx = 0;
     for (int r = 0; r < 16; r++) {
         uint8_t line = glyph[r];
         for (int b = 0; b < 8; b++) {
-            if (line & (0x80 >> b)) {
-                lcd_fill_rect(x + b, y + r, 1, 1, color);
-            } else if (bg != color) {
-                lcd_fill_rect(x + b, y + r, 1, 1, bg);
-            }
+            pixel_buf[idx++] = (line & (0x80 >> b)) ? color_be : bg_be;
         }
     }
+
+    lcd_set_window(x, y, x + 7, y + 15);
+    lcd_data(s_spi_lcd, (const uint8_t *)pixel_buf, 256);
 }
 
 static void lcd_draw_string(uint16_t x, uint16_t y, const char *str, uint16_t color, uint16_t bg) {
     while (*str) {
-        lcd_draw_char(x, y, *str, color, bg);
+        lcd_draw_char_fast(x, y, *str, color, bg);
         x += 8;
         str++;
     }
@@ -279,7 +284,7 @@ static void lcd_init_st7789(void) {
     lcd_cmd(s_spi_lcd, 0x3A);
     lcd_data(s_spi_lcd, &colmod, 1);
 
-    // 0x21 INVON 屏幕反相显示
+    // 0x21 INVON 屏幕反相显示（IPS 必须开启）
     lcd_cmd(s_spi_lcd, 0x21);
 
     lcd_cmd(s_spi_lcd, 0x29); // Display ON
@@ -326,7 +331,7 @@ static void render_vape_ui(void) {
     const int filter_top = filter_bottom - filter_height;
     const int max_shaft_len = 125;
 
-    // 静态背景和框架只绘制一次
+    // 静态背景和框架只绘制一次（绝不频闪）
     if (s_need_full_redraw || g_vape.state != s_prev_state) {
         s_need_full_redraw = false;
         s_prev_state = g_vape.state;
@@ -338,13 +343,13 @@ static void render_vape_ui(void) {
         uint16_t batt_color = g_vape.battery_percent < 20 ? COLOR_EMBER_RED : COLOR_GREEN;
         lcd_fill_rect(8, 6, 20, 12, batt_color);
         lcd_fill_rect(28, 9, 3, 6, batt_color);
-        lcd_draw_string(34, 4, "92%", COLOR_WHITE, COLOR_STATUS_BG);
+        lcd_draw_string(34, 4, "95%", COLOR_WHITE, COLOR_STATUS_BG);
 
-        int juice_w = (int)((g_vape.juice_percent / 100.0f) * 22);
+        int juice_w = (int)((g_vape.juice_percent / 100.0f) * 24);
         lcd_fill_rect(BSP_LCD_WIDTH - 64, 6, juice_w, 12, COLOR_CYAN);
-        lcd_draw_string(BSP_LCD_WIDTH - 38, 4, "OIL", COLOR_CYAN, COLOR_STATUS_BG);
+        lcd_draw_string(BSP_LCD_WIDTH - 36, 4, "OIL", COLOR_CYAN, COLOR_STATUS_BG);
 
-        // 2. 静态烟嘴
+        // 2. 静态滤嘴
         lcd_fill_rect(cig_left, filter_top, cig_width, filter_height, COLOR_AMBER);
         lcd_fill_rect(cig_left - 1, filter_top - 2, cig_width + 2, 3, COLOR_GOLD);
         lcd_fill_rect(cig_left, filter_top, 3, filter_height, 0xFD40);
@@ -355,7 +360,7 @@ static void render_vape_ui(void) {
         lcd_fill_rect(6, 252, BSP_LCD_WIDTH - 12, 62, cur_realm->is_yandi ? 0x3180 : 0x1082);
         lcd_fill_rect(8, 254, BSP_LCD_WIDTH - 16, 58, COLOR_DARK_BG);
 
-        // 绘制境界文字
+        // 绘制境界文字 (高速块缓冲字库)
         lcd_draw_string(14, 258, cur_realm->title, cur_realm->is_yandi ? COLOR_GOLD : COLOR_EMBER_YELLOW, COLOR_DARK_BG);
 
         // 绘制进度和历史总数文字
@@ -370,7 +375,7 @@ static void render_vape_ui(void) {
         }
         lcd_draw_string(14, 278, prog_buf, COLOR_WHITE, COLOR_DARK_BG);
 
-        // 绘制修仙经验条底槽与当前填充
+        // 绘制经验条槽
         lcd_fill_rect(14, 298, BSP_LCD_WIDTH - 28, 6, 0x2104);
         float prog = cur_realm->target_count > 0 ? ((float)g_vape.current_realm_smoked / cur_realm->target_count) : 1.0f;
         if (prog > 1.0f) prog = 1.0f;
@@ -386,7 +391,7 @@ static void render_vape_ui(void) {
         s_prev_tot_smoked = g_vape.total_smoked;
     }
 
-    // 动态增量绘制（不闪屏）
+    // 动态无频闪增量绘制
     if (g_vape.state == STATE_UNLIT) {
         int current_shaft = (int)((max_shaft_len * g_vape.tobacco_remaining) / 100.0f);
         int tip_y = filter_top - current_shaft;
@@ -396,11 +401,11 @@ static void render_vape_ui(void) {
             lcd_fill_rect(cig_left, tip_y, 3, current_shaft, COLOR_WHITE);
             lcd_fill_rect(cig_left + cig_width - 3, tip_y, 3, current_shaft, COLOR_PAPER_SHADOW);
             lcd_fill_rect(cig_left, tip_y - 3, cig_width, 3, COLOR_CHAR_BROWN);
-            // 点火提示蓝光
+            // 提示火星
             lcd_fill_rect(center_x - 1, tip_y - 12, 2, 6, COLOR_FLAME_BLUE);
             lcd_fill_rect(center_x - 4, tip_y - 9, 8, 2, COLOR_FLAME_BLUE);
-            lcd_draw_string(24, 110, "PRESS OK", COLOR_WHITE, COLOR_DARK_BG);
-            lcd_draw_string(24, 128, "TO LIGHT", COLOR_FLAME_BLUE, COLOR_DARK_BG);
+            lcd_draw_string(20, 110, "READY", COLOR_WHITE, COLOR_DARK_BG);
+            lcd_draw_string(20, 128, "LIGHTING", COLOR_FLAME_BLUE, COLOR_DARK_BG);
         }
     } else if (g_vape.state == STATE_LIGHTING) {
         int current_shaft = (int)((max_shaft_len * g_vape.tobacco_remaining) / 100.0f);
@@ -410,8 +415,8 @@ static void render_vape_ui(void) {
         lcd_fill_rect(center_x - 6, tip_y - flame_h, 12, flame_h, COLOR_EMBER_ORANGE);
         lcd_fill_rect(center_x - 3, tip_y - flame_h + 4, 6, flame_h - 8, COLOR_EMBER_YELLOW);
         lcd_fill_rect(center_x - 1, tip_y - flame_h + 8, 2, flame_h - 12, COLOR_WHITE);
-        lcd_draw_string(24, 110, "        ", COLOR_DARK_BG, COLOR_DARK_BG);
-        lcd_draw_string(24, 128, "IGNITING", COLOR_EMBER_ORANGE, COLOR_DARK_BG);
+        lcd_draw_string(20, 110, "     ", COLOR_DARK_BG, COLOR_DARK_BG);
+        lcd_draw_string(20, 128, "IGNITING", COLOR_EMBER_ORANGE, COLOR_DARK_BG);
     } else if (g_vape.state == STATE_BURNING) {
         int current_shaft = (int)((max_shaft_len * g_vape.tobacco_remaining) / 100.0f);
         int ash_h = (int)((g_vape.ash_length / 100.0f) * 125.0f);
@@ -439,16 +444,16 @@ static void render_vape_ui(void) {
                 }
             }
 
-            // 绘制剩余烟量百分比
+            // 右侧清晰显示剩余百分比
             char rem_buf[16];
             snprintf(rem_buf, sizeof(rem_buf), "%3d%%", (int)g_vape.tobacco_remaining);
-            lcd_draw_string(BSP_LCD_WIDTH - 48, 120, rem_buf, COLOR_EMBER_YELLOW, COLOR_DARK_BG);
+            lcd_draw_string(BSP_LCD_WIDTH - 44, 120, rem_buf, COLOR_EMBER_YELLOW, COLOR_DARK_BG);
 
             s_prev_shaft_h = current_shaft;
             s_prev_ash_h = ash_h;
         }
 
-        // 烟蒂微红燃烧
+        // 烟蒂微燃
         lcd_fill_rect(cig_left - 1, tip_y - 2, cig_width + 2, 4, COLOR_EMBER_RED);
         lcd_fill_rect(cig_left + 2, tip_y - 2, cig_width - 4, 3, COLOR_EMBER_YELLOW);
 
@@ -469,14 +474,13 @@ static void render_vape_ui(void) {
         if (s_prev_state != STATE_BURNED_OUT) {
             lcd_fill_rect(cig_left - 10, 26, cig_width + 20, filter_top - 26, COLOR_DARK_BG);
             lcd_fill_rect(cig_left, filter_top - 4, cig_width, 4, COLOR_CHAR_BLACK);
-            lcd_draw_string(24, 110, "SMOKED OUT", COLOR_ASH_GREY, COLOR_DARK_BG);
-            lcd_draw_string(24, 128, "PRESS OK", COLOR_WHITE, COLOR_DARK_BG);
+            lcd_draw_string(20, 110, "SMOKED", COLOR_ASH_GREY, COLOR_DARK_BG);
+            lcd_draw_string(20, 128, "PRESS KEY", COLOR_WHITE, COLOR_DARK_BG);
         }
     }
 
-    // 进度变化更新
     if (g_vape.current_realm_smoked != s_prev_cur_smoked || g_vape.realm_id != s_prev_realm_id || g_vape.total_smoked != s_prev_tot_smoked) {
-        s_need_full_redraw = true; // 仅在晋级或抽完一根时刷新底部面板
+        s_need_full_redraw = true;
     }
 }
 
@@ -485,10 +489,10 @@ void app_main(void) {
     nvs_flash_init();
     nvs_load_smoked_count();
 
-    // 1. 初始化物理按键 GPIO (启用内部上拉)
+    // 1. 初始化按键 (上拉使能)
     gpio_config_t btn_cfg = {
-        .pin_bit_mask = (1ULL << BSP_BTN_UP_GPIO) | (1ULL << BSP_BTN_DOWN_GPIO) |
-                        (1ULL << BSP_BTN_OK_GPIO) | (1ULL << BSP_BTN_POWER_GPIO),
+        .pin_bit_mask = (1ULL << BTN_PIN_BOOT) | (1ULL << BTN_PIN_UP) |
+                        (1ULL << BTN_PIN_DOWN) | (1ULL << BTN_PIN_SIDE),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
     };
@@ -517,54 +521,53 @@ void app_main(void) {
 
     lcd_init_st7789();
 
-    // 按键前一状态用于边沿检测（消除连续重入和浮空误触）
-    bool last_btn_ok = true;
-    bool last_btn_up = true;
-    bool last_btn_down = true;
-    bool last_btn_pwr = true;
+    int boot_delay_ticks = 0;
+    bool last_any_btn = false;
 
     while (1) {
-        bool cur_btn_up = (gpio_get_level(BSP_BTN_UP_GPIO) == 0);
-        bool cur_btn_down = (gpio_get_level(BSP_BTN_DOWN_GPIO) == 0);
-        bool cur_btn_ok = (gpio_get_level(BSP_BTN_OK_GPIO) == 0);
-        bool cur_btn_pwr = (gpio_get_level(BSP_BTN_POWER_GPIO) == 0);
+        // 扫描所有可能的按键引脚（按下拉低 = 0）
+        bool b_boot = (gpio_get_level(BTN_PIN_BOOT) == 0);
+        bool b_up   = (gpio_get_level(BTN_PIN_UP) == 0);
+        bool b_down = (gpio_get_level(BTN_PIN_DOWN) == 0);
+        bool b_side = (gpio_get_level(BTN_PIN_SIDE) == 0);
 
-        // 电源键边沿检测 (按下瞬间触发)
-        if (cur_btn_pwr && !last_btn_pwr) {
-            g_vape.screen_awake = !g_vape.screen_awake;
-            gpio_set_level(BSP_LCD_BACKLIGHT, g_vape.screen_awake ? 1 : 0);
-            if (g_vape.screen_awake) {
-                s_need_full_redraw = true;
-            }
-        }
+        bool cur_any_btn = b_boot || b_up || b_down || b_side;
 
-        // 上/下键弹烟灰
-        if ((cur_btn_up && !last_btn_up) || (cur_btn_down && !last_btn_down)) {
-            flick_ash();
-        }
-
-        // OK 键点烟 / 换新烟
-        if (cur_btn_ok && !last_btn_ok) {
+        // 按键边沿响应（任意按键被按下瞬间触发）
+        if (cur_any_btn && !last_any_btn) {
+            ESP_LOGI(TAG, "Key pressed! Action triggered.");
             if (g_vape.state == STATE_UNLIT) {
+                // 点烟
                 g_vape.state = STATE_LIGHTING;
                 g_vape.state_timer_ms = esp_timer_get_time() / 1000;
                 s_need_full_redraw = true;
+            } else if (g_vape.state == STATE_BURNING) {
+                // 燃烧中按键：如果烟灰有长度则弹烟灰，否则大口抽烟！
+                if (g_vape.ash_length > 4.0f) {
+                    flick_ash();
+                } else {
+                    g_vape.tobacco_remaining -= 3.0f;
+                    g_vape.ash_length += 2.5f;
+                }
             } else if (g_vape.state == STATE_BURNED_OUT) {
+                // 抽完换新烟
                 g_vape.state = STATE_UNLIT;
                 g_vape.tobacco_remaining = 100.0f;
                 g_vape.ash_length = 0.0f;
                 s_need_full_redraw = true;
-            } else if (g_vape.state == STATE_BURNING) {
-                // 燃烧中按 OK 键相当于大口深吸！加速燃烧
-                g_vape.tobacco_remaining -= 2.5f;
-                g_vape.ash_length += 2.0f;
             }
         }
+        last_any_btn = cur_any_btn;
 
-        last_btn_ok = cur_btn_ok;
-        last_btn_up = cur_btn_up;
-        last_btn_down = cur_btn_down;
-        last_btn_pwr = cur_btn_pwr;
+        // 开机 3 秒自动点燃保底（即使硬件按键接触不良，也能自动演示抽烟）
+        if (g_vape.state == STATE_UNLIT) {
+            boot_delay_ticks++;
+            if (boot_delay_ticks > 75) { // 约 3 秒后自动点火
+                g_vape.state = STATE_LIGHTING;
+                g_vape.state_timer_ms = esp_timer_get_time() / 1000;
+                s_need_full_redraw = true;
+            }
+        }
 
         // 点火状态自动过渡
         if (g_vape.state == STATE_LIGHTING) {
@@ -574,12 +577,12 @@ void app_main(void) {
             }
         }
 
-        // 燃烧中的自然慢速微燃
+        // 燃烧中的持续抽吸与自然燃尽
         if (g_vape.state == STATE_BURNING && g_vape.screen_awake) {
-            g_vape.tobacco_remaining -= 0.035f;
-            g_vape.ash_length += 0.035f;
+            g_vape.tobacco_remaining -= 0.045f;
+            g_vape.ash_length += 0.045f;
 
-            if (g_vape.ash_length >= 45.0f) {
+            if (g_vape.ash_length >= 40.0f) {
                 flick_ash(); // 烟灰过长自然脱落
             }
 
@@ -593,7 +596,7 @@ void app_main(void) {
                 if (g_vape.realm_id < 11 && cur_tier->target_count > 0 && g_vape.current_realm_smoked >= cur_tier->target_count) {
                     g_vape.realm_id++;
                     g_vape.current_realm_smoked = 0;
-                    ESP_LOGI(TAG, "Rank breakthrough!");
+                    ESP_LOGI(TAG, "Rank breakthrough to %s!", REALM_TIERS[g_vape.realm_id].title);
                 }
 
                 nvs_save_smoked_count(g_vape.realm_id, g_vape.current_realm_smoked, g_vape.total_smoked);
@@ -602,6 +605,6 @@ void app_main(void) {
         }
 
         render_vape_ui();
-        vTaskDelay(pdMS_TO_TICKS(40)); // 保证调度让出 CPU，喂狗完全正常
+        vTaskDelay(pdMS_TO_TICKS(40));
     }
 }
