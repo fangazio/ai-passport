@@ -2,55 +2,74 @@ name: Build AI-Passport Real BIN Firmware
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
   build:
+    name: Compile ESP32-C3 Firmware Image
     runs-on: ubuntu-latest
-    container: espressif/idf:release-v5.5
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+    container:
+      image: espressif/idf:release-v5.5
 
-      - name: Fix Git Directory Permissions
-        run: |
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-          git config --global --add safe.directory '*'
+    steps:
+      - name: Checkout repository with submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: 'recursive'
+
+      - name: Configure Git Safe Directory
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Build Firmware with ESP-IDF
+        shell: bash
         run: |
           . /opt/esp/idf/export.sh
+          # 如果之前残留了旧的 build 目录，进行清理
+          rm -rf build
+          # 设置目标芯片为 esp32c3
           idf.py set-target esp32c3
+          # 开始全量编译
           idf.py build
 
       - name: Merge Binaries into Single Factory Image (0x0 Direct Flash)
+        shell: bash
         run: |
           . /opt/esp/idf/export.sh
-          if [ -f "build/ai-passport.bin" ]; then
-            APP_BIN="build/ai-passport.bin"
-          elif [ -f "build/ai_passport_vape_firmware.bin" ]; then
-            APP_BIN="build/ai_passport_vape_firmware.bin"
+          echo "Attempting to create single factory binary..."
+          if idf.py merge-bin -o build/ai_passport_vape_factory_merged.bin; then
+            echo "Successfully generated merged binary with idf.py merge-bin"
           else
-            APP_BIN=$(ls build/*.bin | grep -v 'bootloader' | grep -v 'partition' | grep -v 'merged' | head -n 1)
+            echo "Falling back to esptool.py manual merge..."
+            if [ -f "build/ai-passport.bin" ]; then
+              APP_BIN="build/ai-passport.bin"
+            elif [ -f "build/ai_passport_vape_firmware.bin" ]; then
+              APP_BIN="build/ai_passport_vape_firmware.bin"
+            else
+              APP_BIN=$(ls build/*.bin | grep -v 'bootloader' | grep -v 'partition' | grep -v 'merged' | head -n 1)
+            fi
+            echo "Selected application binary: $APP_BIN"
+            esptool.py --chip esp32c3 merge_bin \
+              -o build/ai_passport_vape_factory_merged.bin \
+              --fill-flash-size 8MB \
+              0x0 build/bootloader/bootloader.bin \
+              0x8000 build/partition_table/partition-table.bin \
+              0x10000 "$APP_BIN"
           fi
-          echo "Selected application binary: $APP_BIN"
-          esptool.py --chip esp32c3 merge_bin \
-            -o build/ai_passport_vape_factory_merged.bin \
-            --fill-flash-size 8MB \
-            0x0 build/bootloader/bootloader.bin \
-            0x8000 build/partition_table/partition-table.bin \
-            0x10000 "$APP_BIN"
 
-      - name: Upload Flashable BIN Artifacts
+      - name: Upload Single Factory Merged BIN
         uses: actions/upload-artifact@v4
         with:
-          name: ai-passport-vape-firmware-bins
+          name: ai_passport_vape_factory_merged
+          path: build/ai_passport_vape_factory_merged.bin
+
+      - name: Upload All Partition Bins
+        uses: actions/upload-artifact@v4
+        with:
+          name: all_passport_firmware_bins
           path: |
-            build/ai_passport_vape_factory_merged.bin
             build/bootloader/bootloader.bin
             build/partition_table/partition-table.bin
             build/*.bin
